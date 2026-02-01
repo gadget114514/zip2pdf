@@ -11,6 +11,7 @@ import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import time
+import gc
 
 # Global control for interruptions
 stop_event = threading.Event()
@@ -409,6 +410,13 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
 
     # 2. Combine
     combined_html = "\n<div style='page-break-after: always;'></div>\n".join(batch_htmls)
+    
+    # FREE MEMORY: local_zip_map and batch_htmls are no longer needed
+    del local_zip_map
+    del batch_htmls
+    # Note: local_css_cache is small usually, but good practice
+    del local_css_cache
+    gc.collect()
 
     # 3. Target Path
     name_part, ext_part = os.path.splitext(output_basename)
@@ -425,6 +433,10 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     # In Process, stop_event is a copy of the state at fork (False).
     # It won't update. So Ctrl+C might leave zombies. Valid limitation for now.
     run_wkhtmltopdf(wkhtml_path, combined_html, target_path, verbose, part_info, file_range_msg, log_enabled)
+    
+    # FREE MEMORY: combined_html is huge string
+    del combined_html
+    gc.collect()
 
 
 def load_zip_chunk(source, file_names):
@@ -619,6 +631,13 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
             actual_pdf_jobs = pdf_jobs if pdf_jobs and pdf_jobs > 0 else jobs
             print(f"  Launching {actual_pdf_jobs} pipeline PROCESS workers...")
             
+            # FREE MEMORY in Main Process
+            # We don't need the content anymore, workers read from disk/cache
+            del zip_map
+            if 'zip_source_data' in locals(): del zip_source_data
+            if 'worker_source' in locals(): del worker_source
+            gc.collect()
+
             with ProcessPoolExecutor(max_workers=actual_pdf_jobs) as executor:
                 futures = []
                 for i, batch in enumerate(batches, 1):
