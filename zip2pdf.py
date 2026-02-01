@@ -229,8 +229,12 @@ def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", f
         print(f"Error during PDF generation for {part_info}: {e}")
         process.kill()
 
-def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None):
+def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False):
     if stop_event.is_set(): return None, 0
+    
+    # Get thread name for logging
+    t_name = threading.current_thread().name
+    
     ext = os.path.splitext(file_name.lower())[1]
     raw_data = zip_map[file_name]
     file_size = len(raw_data)
@@ -267,6 +271,11 @@ def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=Non
             text_content = raw_data.decode('latin-1')
         text_content = text_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         content_result = f'<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: monospace; background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">{text_content}</pre>'
+
+    if log_enabled:
+         # Shorten thread name to just the number if possible "ThreadPoolExecutor-0_0" -> "0_0"
+         short_t = t_name.replace("ThreadPoolExecutor-", "T")
+         print(f"  [Index][{short_t}] Processed: {file_name}")
 
     return content_result, file_size
 
@@ -314,11 +323,11 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
             
             return
 
-    # --- Phase 1: Scanning/Reading ZIP ---
-    print(f"\n=== Phase 1: Reading ZIP File ({zip_path}) ===")
+        # --- Phase 1: Scanning/Reading ZIP ---
+        print(f"\n=== Phase 1: Reading ZIP File ({zip_path}) ===")
 
-    # 1. Map all files in the ZIP for cross-referencing
-    zip_map = {} # path -> binary data
+        # 1. Map all files in the ZIP for cross-referencing
+        zip_map = {} # path -> binary data
         
         if memory_mode:
             if verbose: print(f"  [MEMORY] Reading entire ZIP into memory...")
@@ -348,7 +357,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
         css_lock = threading.Lock()
 
         with ThreadPoolExecutor(max_workers=jobs) as executor:
-            future_to_idx = {executor.submit(process_single_file, all_files[i], zip_map, verbose, ignore_icons, css_cache, css_lock): i for i in range(num_all)}
+            future_to_idx = {executor.submit(process_single_file, all_files[i], zip_map, verbose, ignore_icons, css_cache, css_lock, log_enabled): i for i in range(num_all)}
             indexed_count = 0
             for future in as_completed(future_to_idx):
                 if stop_event.is_set(): break
@@ -361,8 +370,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 except Exception as e:
                     if verbose: print(f"Error processing {all_files[idx]}: {e}")
                 
-                if log_enabled:
-                    print(f"  [Index] Processed: {all_files[idx]}")
+                # Logging moved inside process_single_file to capture thread ID correctly
                 
                 indexed_count += 1
                 if not verbose and not log_enabled and (indexed_count % 10 == 0 or indexed_count == num_all):

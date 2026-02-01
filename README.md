@@ -104,6 +104,4 @@ options:
 ## License
 
 MIT
-=======
-# zip2pdf
 
