@@ -1,0 +1,514 @@
+import zipfile
+import pdfkit
+import argparse
+import os
+import sys
+import io
+import base64
+import mimetypes
+import re
+import threading
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Global control for interruptions
+stop_event = threading.Event()
+active_procs = []
+procs_lock = threading.Lock()
+
+def get_b64_src(zip_map, current_html_path, linked_path, depth, verbose, css_cache=None, css_lock=None):
+    if stop_event.is_set(): return None
+    if depth > 5:
+        if verbose: print(f"    [SKIP] Depth limit reached for {linked_path}")
+        return None
+    
+    # Normalize the linked path for searching
+    clean_path = linked_path.replace('\\', '/').strip()
+    
+    # Helper to find data in zip_map
+    def find_in_zip(target):
+        target = target.replace('\\', '/').strip('/')
+        return zip_map.get(target)
+
+    data = None
+    found_path = clean_path
+    
+    # Strategy 1: Absolute or direct path check
+    data = find_in_zip(clean_path)
+    
+    # Strategy 2: Relative to current HTML location
+    if data is None and current_html_path:
+        html_dir = os.path.dirname(current_html_path)
+        rel_candidate = os.path.normpath(os.path.join(html_dir, clean_path)).replace('\\', '/')
+        data = find_in_zip(rel_candidate)
+        if data: found_path = rel_candidate
+
+    # Strategy 3: Global filename search (Last resort)
+    if data is None:
+        basename = os.path.basename(clean_path)
+        for z_path, z_data in zip_map.items():
+            if os.path.basename(z_path) == basename:
+                data = z_data
+                found_path = z_path
+                break
+    
+    if data:
+        if verbose: print(f"    [RESOLVED] {linked_path}")
+        ext = os.path.splitext(found_path.lower())[1]
+        mime = mimetypes.guess_type(found_path)[0] or 'application/octet-stream'
+        
+        # If it's a CSS file, we should recursively resolve its imports (depth + 1)
+        if ext == '.css':
+            # Check cache first
+            if css_cache is not None and found_path in css_cache:
+                if verbose and depth <= 1: print(f"    [CACHE] Hit for {found_path}")
+                data = css_cache[found_path]
+            else:
+                try:
+                    css_text = data.decode('utf-8')
+                except UnicodeDecodeError:
+                    css_text = data.decode('latin-1')
+                
+                # Resolve recursively
+                resolved_css = resolve_resources(zip_map, found_path, css_text, depth + 1, verbose, css_cache, css_lock).encode('utf-8')
+                data = resolved_css
+                
+                # Update cache safely
+                if css_cache is not None and css_lock is not None:
+                    with css_lock:
+                        css_cache[found_path] = data
+
+        b64 = base64.b64encode(data).decode('utf-8')
+        return f"data:{mime};base64,{b64}"
+    elif verbose and not linked_path.startswith(('http', 'data')):
+        print(f"    [MISSING]  {linked_path}")
+    return None
+
+def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=None, css_lock=None, ignore_icons=False):
+    if depth > 5: return content
+    
+    if verbose: print(f"  > [{depth}] Resolving resources for {current_file}...")
+    
+    def apply_resolution(text, is_head=False):
+        def replacer(match):
+            attr = match.group(1)
+            path = match.group(2)
+            if path.lower().startswith(('http://', 'https://', 'data:')):
+                return match.group(0)
+            
+            if ignore_icons:
+                ext = os.path.splitext(path.lower())[1]
+                is_favicon = "favicon" in path.lower() or ext == ".ico"
+                
+                if is_favicon or (is_head and ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}):
+                    if verbose and is_favicon: print(f"    [SKIP] Ignoring icon/favicon: {path}")
+                    return match.group(0)
+            
+            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock)
+            return f'{attr}="{b64}"' if b64 else match.group(0)
+        
+        text = re.sub(r'(src|href)=["\'](.*?)["\']', replacer, text)
+        
+        def css_url_repl(match):
+            path = match.group(1).strip('"\'')
+            if path.lower().startswith(('http', 'data')): return match.group(0)
+            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock)
+            return f'url("{b64}")' if b64 else match.group(0)
+        
+        text = re.sub(r'url\((.*?)\)', css_url_repl, text)
+        return text
+
+    # For HTML files, separate head and body to apply specific rules
+    if current_file.lower().endswith(('.html', '.htm')):
+        parts = re.split(r'(</head>)', content, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 3:
+            # parts[0]: content before </head>, parts[1]: </head>, parts[2]: rest
+            return apply_resolution(parts[0], is_head=True) + parts[1] + apply_resolution(parts[2], is_head=False)
+    
+    return apply_resolution(content)
+
+def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", file_range_info="", log_enabled=False):
+    if stop_event.is_set():
+        return
+    
+    # Identify job ID from part_info for cleaner log
+    job_id = part_info.split(' ')[1] if ' ' in part_info else part_info
+    
+    if not verbose_mode:
+        print(f"  > [Job {job_id}] Started: {file_range_info}")
+
+    cmd = [
+        wkhtml_path, 
+        "--enable-local-file-access", 
+        "--encoding", "UTF-8",
+        "--load-error-handling", "ignore",
+        "--load-media-error-handling", "ignore"
+    ]
+    if not verbose_mode and not log_enabled:
+        cmd.append("--quiet")
+    cmd.extend(["-", target])
+
+    process = subprocess.Popen(
+        cmd, 
+        stdin=subprocess.PIPE, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding='utf-8',
+        errors='replace'
+    )
+    
+    # Log PID to prove parallelism
+    if not verbose_mode:
+        print(f"  > [Job {job_id}] Spawned process PID: {process.pid}")
+
+    with procs_lock:
+        active_procs.append(process)
+
+    def writer():
+        try:
+            process.stdin.write(html_str)
+            process.stdin.close()
+        except Exception as e:
+            if verbose_mode: print(f"Writer error in {part_info}: {e}")
+
+    write_thread = threading.Thread(target=writer)
+    write_thread.start()
+
+    try:
+        if stop_event.is_set():
+            process.terminate()
+            return
+
+        while True:
+            # Check for stop signal appropriately
+            if stop_event.is_set():
+                process.terminate()
+                break
+                
+            line = process.stderr.readline()
+            if not line:
+                if process.poll() is not None:
+                    break
+                continue
+                
+            line = line.strip()
+            if not line: continue
+            
+            status_update = ""
+            if "Loading pages" in line: status_update = "Loading pages..."
+            elif "Counting pages" in line: status_update = "Counting pages..."
+            elif "Printing pages" in line: status_update = "Printing pages..."
+            elif "Done" in line: status_update = "Done!"
+
+            if verbose_mode:
+                if status_update: print(f"  [{part_info}] [STATUS] {status_update}")
+                print(f"    [{part_info}] [wkhtml] {line}")
+            elif log_enabled:
+                 print(f"    [Job {job_id}] {line}")
+            else:
+                if status_update:
+                    # If parallel (part_info provided and likely >1 job), avoid \r to prevent overwrite mess
+                    print(f"  > [Job {job_id}] {status_update}")
+
+        process.wait()
+        write_thread.join()
+        
+        with procs_lock:
+            if process in active_procs:
+                active_procs.remove(process)
+        
+        if stop_event.is_set():
+            return
+
+        if not verbose_mode: print(f"  > [Job {job_id}] Finished: Processed successfully.")
+
+        if process.returncode != 0:
+            print(f"Error: {part_info} failed with exit code {process.returncode}")
+    except Exception as e:
+        print(f"Error during PDF generation for {part_info}: {e}")
+        process.kill()
+
+def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None):
+    if stop_event.is_set(): return None, 0
+    ext = os.path.splitext(file_name.lower())[1]
+    raw_data = zip_map[file_name]
+    file_size = len(raw_data)
+    
+    content_result = None
+    
+    # HTML: Resolve internal links
+    if ext in {'.html', '.htm'}:
+        try:
+            text = raw_data.decode('utf-8')
+        except UnicodeDecodeError:
+            text = raw_data.decode('latin-1')
+        content_result = resolve_resources(zip_map, file_name, text, 0, verbose, css_cache, css_lock, ignore_icons)
+    
+    # Image: Wrap in HTML
+    elif ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}:
+        mime_type = mimetypes.guess_type(file_name)[0] or 'image/png'
+        b64 = base64.b64encode(raw_data).decode('utf-8')
+        content_result = f'<div style="text-align:center; page-break-inside: avoid;"><img src="data:{mime_type};base64,{b64}" style="max-width:100%; height:auto;"></div>'
+    
+    # CSS: Injected
+    elif ext == '.css':
+        try:
+            css = raw_data.decode('utf-8')
+        except UnicodeDecodeError:
+            css = raw_data.decode('latin-1')
+        content_result = f'<style>{css}</style>'
+
+    # Text: Pre-formatted
+    elif ext in {'.txt', '.md', '.py', '.js', '.json', '.log', '.csv', '.xml', '.cs'}:
+        try:
+            text_content = raw_data.decode('utf-8')
+        except UnicodeDecodeError:
+            text_content = raw_data.decode('latin-1')
+        text_content = text_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        content_result = f'<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: monospace; background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">{text_content}</pre>'
+
+    return content_result, file_size
+
+def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=None, info_mode=False, log_enabled=False):
+    """
+    Reads files from a ZIP and converts them into one or more PDF files in output_dir.
+    """
+    if not os.path.exists(zip_path):
+        print(f"Error: ZIP file '{zip_path}' not found.")
+        return
+
+    # Ensure output directory exists
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        if verbose: print(f"Created output directory: {output_dir}")
+
+    try:
+        # Reset global state
+        stop_event.clear()
+        with procs_lock:
+            active_procs.clear()
+
+        if info_mode:
+            print(f"Scanning ZIP file summary: {zip_path}")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                file_list = [n for n in zf.namelist() if not n.endswith('/')]
+            
+            num_files = len(file_list)
+            html_count = sum(1 for f in file_list if f.lower().endswith(('.html', '.htm')))
+            img_count = sum(1 for f in file_list if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg')))
+            css_count = sum(1 for f in file_list if f.lower().endswith('.css'))
+            other_count = num_files - html_count - img_count - css_count
+            
+            print(f"{'-'*40}")
+            print(f"Total files found: {num_files}")
+            print(f"  - HTML/HTM: {html_count}")
+            print(f"  - Images:   {img_count}")
+            print(f"  - CSS:      {css_count}")
+            print(f"  - Others:   {other_count}")
+            print(f"{'-'*40}")
+
+            if files_per_pdf > 0:
+                est_parts = (num_files + files_per_pdf - 1) // files_per_pdf
+                print(f"With --files-per-pdf {files_per_pdf}, this will generate approximately {est_parts} PDF parts.")
+            
+            return
+
+    # --- Phase 1: Scanning/Reading ZIP ---
+    print(f"\n=== Phase 1: Reading ZIP File ({zip_path}) ===")
+
+    # 1. Map all files in the ZIP for cross-referencing
+    zip_map = {} # path -> binary data
+        
+        if memory_mode:
+            if verbose: print(f"  [MEMORY] Reading entire ZIP into memory...")
+            with open(zip_path, 'rb') as f:
+                zip_buffer = io.BytesIO(f.read())
+            zf_source = zip_buffer
+        else:
+            zf_source = zip_path
+
+        with zipfile.ZipFile(zf_source, 'r') as zf:
+            for name in zf.namelist():
+                if not name.endswith('/'):
+                    zip_map[name] = zf.read(name)
+
+        all_files = sorted(zip_map.keys())
+        num_all = len(all_files)
+        
+        # --- Phase 2: Indexing ---
+        print(f"\n=== Phase 2: Indexing and Resolving Resources ===")
+        print(f"Found {num_all} files. Processing with {jobs} threads...")
+
+        html_contents = [None] * num_all
+        html_sizes = [0] * num_all
+
+        # Prepare CSS cache
+        css_cache = {}
+        css_lock = threading.Lock()
+
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            future_to_idx = {executor.submit(process_single_file, all_files[i], zip_map, verbose, ignore_icons, css_cache, css_lock): i for i in range(num_all)}
+            indexed_count = 0
+            for future in as_completed(future_to_idx):
+                if stop_event.is_set(): break
+                idx = future_to_idx[future]
+                try:
+                    content, size = future.result()
+                    if content:
+                        html_contents[idx] = content
+                        html_sizes[idx] = size
+                except Exception as e:
+                    if verbose: print(f"Error processing {all_files[idx]}: {e}")
+                
+                if log_enabled:
+                    print(f"  [Index] Processed: {all_files[idx]}")
+                
+                indexed_count += 1
+                if not verbose and not log_enabled and (indexed_count % 10 == 0 or indexed_count == num_all):
+                    print(f"\r  > Indexing files... [{indexed_count}/{num_all}]", end="", flush=True)
+        
+        if stop_event.is_set():
+            print("\nOperation cancelled.")
+            return
+
+        print() # Newline after progress bar
+
+        # Remove skipped files (where content_result was None)
+        html_contents = [c for c in html_contents if c is not None]
+        html_sizes = [s for s in html_sizes if s > 0] # Ensure size is also valid
+
+        total_size = sum(html_sizes)
+
+        # --- Phase 3: Batching ---
+        print(f"\n=== Phase 3: Creating PDF Batches ===")
+
+        # Calculate batch size
+        limit_bytes = int(max_size_mb * 1024 * 1024 * 0.9)
+        parts_by_size = (total_size + limit_bytes - 1) // limit_bytes
+        
+        if parts_by_size > max_files:
+            print(f"Warning: Total size ({total_size/1024/1024:.1f}MB) exceeds limit for {max_files} files. Adjusting batch threshold.")
+            batch_threshold = (total_size + max_files - 1) // max_files
+        else:
+            batch_threshold = limit_bytes
+
+        print(f"Total size: {total_size/1024/1024:.1f}MB. Target parts: {min(max(1, parts_by_size), max_files)}.")
+
+        name_part, ext_part = os.path.splitext(output_basename)
+        if not ext_part:
+            ext_part = ".pdf"
+        
+        # Prepare batches
+        batches = []
+        
+        if files_per_pdf > 0:
+            # Enforce parallelization by explicitly splitting into chunks of files_per_pdf
+            print(f"Splitting into batches of {files_per_pdf} files each (ignoring count/limit auto-split)...")
+            for i in range(0, len(html_contents), files_per_pdf):
+                batches.append(html_contents[i : i + files_per_pdf])
+        else:
+            # Automatic size-based batching
+            current_batch = []
+            current_size = 0
+            
+            for content, size in zip(html_contents, html_sizes):
+                if current_batch and (current_size + size > batch_threshold) and (len(batches) < max_files - 1):
+                    batches.append(current_batch)
+                    current_batch = [content]
+                    current_size = size
+                else:
+                    current_batch.append(content)
+                    current_size += size
+            
+            if current_batch:
+                batches.append(current_batch)
+
+        # Find wkhtmltopdf path
+        wkhtml_path = "wkhtmltopdf" # Default in PATH
+        default_win_path = r'C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe'
+        if os.path.exists(default_win_path):
+            wkhtml_path = default_win_path
+
+        # Generate PDFs in parallel
+        # Use specific pdf_jobs if provided, otherwise default to general jobs count
+        actual_pdf_jobs = pdf_jobs if pdf_jobs and pdf_jobs > 0 else jobs
+        
+        # --- Phase 4: Generation ---
+        print(f"\n=== Phase 4: Generating PDFs ===")
+        print(f"Generating {len(batches)} PDF parts in parallel (max {actual_pdf_jobs} workers)...")
+        with ThreadPoolExecutor(max_workers=actual_pdf_jobs) as executor:
+            current_file_idx = 0
+            futures = []
+            for i, batch in enumerate(batches, 1):
+                filename = output_basename if len(batches) == 1 else f"{name_part}_{i}{ext_part}"
+                target_path = os.path.join(output_dir, filename)
+                
+                # Calculate file range for this batch
+                start_idx = current_file_idx + 1
+                end_idx = current_file_idx + len(batch)
+                file_range_msg = f"Files {start_idx}-{end_idx} ({len(batch)} files)"
+                current_file_idx = end_idx
+                
+                # Add page break between documents in a batch
+                combined_html = "\n<div style='page-break-after: always;'></div>\n".join(batch)
+                
+                futures.append(executor.submit(run_wkhtmltopdf, wkhtml_path, combined_html, target_path, verbose, f"Part {i}/{len(batches)}", file_range_msg, log_enabled))
+            
+            for future in as_completed(futures):
+                if stop_event.is_set(): break
+                # Wait for each future to complete and handle any exceptions
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"PDF generation generated an exception: {exc}")
+
+        if stop_event.is_set():
+            print("\nOperation cancelled during PDF generation.")
+        else:
+            print("\nAll conversions completed successfully.")
+
+    except KeyboardInterrupt:
+        print("\n\n[Ctrl+C] Stopping... Please wait for cleanup.")
+        stop_event.set()
+        
+        # Kill active child processes
+        with procs_lock:
+            for p in active_procs:
+                if p.poll() is None:
+                    try:
+                        p.terminate()
+                    except:
+                        pass
+        try:
+             # Give them a moment to die gracefully
+             pass
+        except:
+            pass
+        
+        sys.exit(1)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert HTML/Images in a ZIP to PDF files in a specified folder.")
+    parser.add_argument("input_zip", help="Path to the source ZIP file")
+    parser.add_argument("output_dir", help="Directory where the PDF files will be saved")
+    parser.add_argument("output_basename", help="Base filename for the output PDF(s)")
+    parser.add_argument("--max-size", type=float, default=150, help="Max size of each PDF in MB (default: 150)")
+    parser.add_argument("--max-files", type=int, default=20, help="Max number of split PDF files (default: 20)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed progress information")
+    parser.add_argument("-c", "--memory-mode", action="store_true", help="Read entire ZIP file into memory before processing")
+    parser.add_argument("-x", "--ignore-icons", action="store_true", help="Ignore favicon and header section icons")
+    parser.add_argument("-j", "--jobs", type=int, default=4, help="Number of parallel jobs (default: 4)")
+    parser.add_argument("--files-per-pdf", type=int, default=0, help="Enforce specific number of files per PDF (overrides auto-splitting)")
+    parser.add_argument("--pdf-jobs", type=int, default=0, help="Number of parallel wkhtmltopdf instances (default: same as --jobs)")
+    parser.add_argument("--info", action="store_true", help="Display file count and details without converting")
+    parser.add_argument("--log", action="store_true", help="Show processing log messages (filenames and wkhtmltopdf output)")
+
+    args = parser.parse_args()
+    convert_zip_to_pdf(args.input_zip, args.output_dir, args.output_basename, args.max_size, args.max_files, args.verbose, args.memory_mode, args.ignore_icons, args.jobs, args.files_per_pdf, args.pdf_jobs, args.info, args.log)
+
+if __name__ == "__main__":
+    main()
