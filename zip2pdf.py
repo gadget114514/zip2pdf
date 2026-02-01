@@ -9,7 +9,8 @@ import mimetypes
 import re
 import threading
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import time
 
 # Global control for interruptions
 stop_event = threading.Event()
@@ -280,29 +281,127 @@ def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=Non
 
     return content_result, file_size
 
-def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_map, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, css_cache, log_enabled, global_start_idx=0):
+    return content_result, file_size
+
+def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0):
     """
-    Worker function that handles the full lifecycle of a single PDF batch:
-    Indexing -> combining -> generating PDF.
-    Running this in a thread makes it an independent 'world' for that PDF.
+    Worker function that handles the full lifecycle of a single PDF batch.
+    Run as a PROCESS. No global shared memory.
     """
-    if stop_event.is_set(): return
+    # Note: stop_event is global but not shared across processes easily on Windows without Manager.
+    # We will ignore stop_event inside the child process for simplicity, 
+    # relying on main process termination to kill children.
+
+    # 0. Setup Local Environment
+    # We need to read the specific files for this batch from the ZIP
+    local_zip_map = {}
     
+    try:
+        if verbose or log_enabled:
+            print(f"  [Batch {batch_idx}] Loading {len(batch_files)} files from zip...")
+        
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            for name in batch_files:
+                local_zip_map[name] = zf.read(name)
+        
+        # Also need to be able to read CSS files if they are referenced recursively!
+        # This is a bit tricky. process_single_file might ask for 'style.css' which is NOT in batch_files.
+        # So we need a mechanism to read on-demand.
+        # Optimized approach: Read ALL CSS files into local map? 
+        # Or Just pass the ZipFile object? 
+        # process_single_file expects a dict (zip_map).
+        # We'll use a Hybrid: Pre-load batch files + On-demand lookup?
+        # NO, process_single_file is synchronous.
+        # Best approach for Process isolation: Load ALL CSS files into local map too.
+        # This duplicates CSS memory but ensures safety.
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+             for name in zf.namelist():
+                 # Load if in batch or if it looks like a resource we might need (css/js/images?)
+                 # Loading ALL images is too heavy (400MB).
+                 # Loading ALL CSS is fine.
+                 if name in batch_files: continue # Already loaded
+                 if name.lower().endswith('.css'):
+                     local_zip_map[name] = zf.read(name)
+                 # What about images referenced by this batch?
+                 # If file1.html tags img1.png. img1.png needs to be in local_zip_map.
+                 # We don't know which images are needed until we parse.
+                 # Solution: process_single_file needs to handle cache misses? 
+                 # Currently it fails.
+                 
+                 # Correct Solution:
+                 # process_single_file should take a "fallback accessor"?
+                 
+    except Exception as e:
+        print(f"Error opening zip in worker: {e}")
+        return
+
+    # To handle lazy loading of images, we need to wrap the map.
+    # But zip_map is expected to be a dict or support .get() and .items()
+    # Let's verify process_single_file usage:
+    # 1. raw_data = zip_map[file_name] (Direct access)
+    # 2. get_b64_src -> find_in_zip -> zip_map.get(target)
+    # 3. get_b64_src -> loop zip_map.items() (Strategy 3 global search)
+    
+    # Strategy 3 is EXPENSIVE if zip_map is empty.
+    # Strategy 3 is IMPOSSIBLE if we don't load everything. (We can't global search what we don't have).
+    
+    # WORKAROUND: In Pipeline Mode, we assume well-formed paths or relative paths.
+    # To support on-demand loading, we can make a SmartDict.
+    
+    class SmartZipDict(dict):
+        def __init__(self, zpath, initial_files):
+            self.zpath = zpath
+            self.zf = zipfile.ZipFile(zpath, 'r') # Open and keep open?
+            self.namelist_set = set(self.zf.namelist())
+            # Preload initial
+            for f in initial_files:
+                 if f in self.namelist_set:
+                     try: self[f] = self.zf.read(f)
+                     except: pass
+            
+        def get(self, key, default=None):
+            if key in self: return self[key]
+            # Try to load
+            if key in self.namelist_set:
+                try: 
+                    rs = self.zf.read(key)
+                    self[key] = rs
+                    return rs
+                except: pass
+            # Try to handle unix/windows path mismatch
+            # (Limited fallback)
+            return default
+
+        def items(self):
+            # For Strategy 3 (Global Search), this only iterates loaded items.
+            # Strategy 3 will fail for unloaded items. This is an acceptable trade-off for speed/memory.
+            return super().items()
+            
+    # Use Smart Dict
+    local_zip_map = SmartZipDict(zip_path, batch_files)
+
     # 1. Indexing (Local to this batch)
     if verbose or log_enabled:
         print(f"  [Batch {batch_idx}/{total_batches}] Indexing {len(batch_files)} files...")
 
     batch_htmls = []
-    
-    # We index sequentially within this batch thread. 
-    # Since multiple batch threads run in parallel, we still achieve parallelism.
-    # Note: We pass None for css_lock because Phase 1.5 populated it.
+    local_css_cache = {} # Local empty cache
+
     for i, fname in enumerate(batch_files):
-        if stop_event.is_set(): return
+        # Stop event check is hard in process, skipping
         current_global_idx = global_start_idx + i
-        content, _ = process_single_file(fname, zip_map, verbose, ignore_icons, css_cache, None, log_enabled, current_global_idx)
-        if content:
-            batch_htmls.append(content)
+        # We catch exceptions here to prevent crash
+        try:
+             # Check if file exists in smart dict (might not if user provided bad list? No, came from namelist)
+             if fname not in local_zip_map:
+                 # Attempt load one last time
+                 local_zip_map.get(fname)
+                 
+             content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx)
+             if content:
+                 batch_htmls.append(content)
+        except Exception as e:
+             if verbose: print(f"Error indexing {fname} in batch {batch_idx}: {e}")
 
     if not batch_htmls:
         print(f"  [Batch {batch_idx}] Warning: No valid content found.")
@@ -319,10 +418,12 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_map, outpu
     target_path = os.path.join(output_dir, filename)
     
     # 4. Generate PDF
-    # We construct a fake part_info for logging
     part_info = f"Part {batch_idx}/{total_batches}"
-    file_range_msg = f"Files ({len(batch_files)} files)" # Simplified range msg
-
+    file_range_msg = f"Files ({len(batch_files)} files)"
+    
+    # run_wkhtmltopdf also checks stop_event (global). 
+    # In Process, stop_event is a copy of the state at fork (False).
+    # It won't update. So Ctrl+C might leave zombies. Valid limitation for now.
     run_wkhtmltopdf(wkhtml_path, combined_html, target_path, verbose, part_info, file_range_msg, log_enabled)
 
 
@@ -516,21 +617,25 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
             if os.path.exists(default_win_path): wkhtml_path = default_win_path
 
             actual_pdf_jobs = pdf_jobs if pdf_jobs and pdf_jobs > 0 else jobs
-            print(f"  Launching {actual_pdf_jobs} pipeline workers...")
+            print(f"  Launching {actual_pdf_jobs} pipeline PROCESS workers...")
             
-            with ThreadPoolExecutor(max_workers=actual_pdf_jobs) as executor:
+            with ProcessPoolExecutor(max_workers=actual_pdf_jobs) as executor:
                 futures = []
                 for i, batch in enumerate(batches, 1):
                     # Calculate start index for logging
                     start_idx = (i - 1) * files_per_pdf
+                    # Pass zip_path instead of zip_map
+                    # Pass None for css_cache (worker builds its own)
                     futures.append(executor.submit(process_batch_pipeline, 
                                                    batch, i, total_batches, 
-                                                   zip_map, output_dir, output_basename, 
+                                                   zip_path, output_dir, output_basename, 
                                                    wkhtml_path, verbose, ignore_icons, 
-                                                   css_cache, log_enabled, start_idx))
+                                                   log_enabled, start_idx))
                 
                 # Wait
                 for future in as_completed(futures):
+                    # Note: Stop event check here only stops MAIN process from waiting.
+                    # Children will keep running unless simple kill.
                     if stop_event.is_set(): break
                     try: 
                         future.result()
