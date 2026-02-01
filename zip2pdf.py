@@ -11,7 +11,10 @@ import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import time
 import gc
+import traceback
 
 # Global control for interruptions
 stop_event = threading.Event()
@@ -231,11 +234,15 @@ def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", f
         print(f"Error during PDF generation for {part_info}: {e}")
         process.kill()
 
-def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False, file_index=-1):
+def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False, file_index=-1, context_id=None):
     if stop_event.is_set(): return None, 0
     
-    # Get thread name for logging
-    t_name = threading.current_thread().name
+    # Get identifier for logging (Thread Name or Explicit Batch ID)
+    if context_id:
+        short_t = context_id
+    else:
+        t_name = threading.current_thread().name
+        short_t = t_name.replace("ThreadPoolExecutor-", "T")
     
     ext = os.path.splitext(file_name.lower())[1]
     raw_data = zip_map[file_name]
@@ -275,14 +282,41 @@ def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=Non
         content_result = f'<pre style="white-space: pre-wrap; word-wrap: break-word; font-family: monospace; background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">{text_content}</pre>'
 
     if log_enabled:
-         # Shorten thread name to just the number if possible "ThreadPoolExecutor-0_0" -> "0_0"
-         short_t = t_name.replace("ThreadPoolExecutor-", "T")
          idx_str = f"[#{file_index}]" if file_index >= 0 else ""
          print(f"  [Index]{idx_str}[{short_t}] Processed: {file_name}")
 
     return content_result, file_size
 
     return content_result, file_size
+
+class SmartZipDict(dict):
+    def __init__(self, zpath, initial_files):
+        self.zpath = zpath
+        self.zf = zipfile.ZipFile(zpath, 'r') # Open and keep open?
+        self.namelist_set = set(self.zf.namelist())
+        # Preload initial
+        for f in initial_files:
+                if f in self.namelist_set:
+                    try: self[f] = self.zf.read(f)
+                    except: pass
+        
+    def get(self, key, default=None):
+        if key in self: return self[key]
+        # Try to load
+        if key in self.namelist_set:
+            try: 
+                rs = self.zf.read(key)
+                self[key] = rs
+                return rs
+            except: pass
+        # Try to handle unix/windows path mismatch
+        # (Limited fallback)
+        return default
+
+    def items(self):
+        # For Strategy 3 (Global Search), this only iterates loaded items.
+        # Strategy 3 will fail for unloaded items. This is an acceptable trade-off for speed/memory.
+        return super().items()
 
 def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0):
     """
@@ -347,36 +381,8 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     # Strategy 3 is IMPOSSIBLE if we don't load everything. (We can't global search what we don't have).
     
     # WORKAROUND: In Pipeline Mode, we assume well-formed paths or relative paths.
-    # To support on-demand loading, we can make a SmartDict.
-    
-    class SmartZipDict(dict):
-        def __init__(self, zpath, initial_files):
-            self.zpath = zpath
-            self.zf = zipfile.ZipFile(zpath, 'r') # Open and keep open?
-            self.namelist_set = set(self.zf.namelist())
-            # Preload initial
-            for f in initial_files:
-                 if f in self.namelist_set:
-                     try: self[f] = self.zf.read(f)
-                     except: pass
-            
-        def get(self, key, default=None):
-            if key in self: return self[key]
-            # Try to load
-            if key in self.namelist_set:
-                try: 
-                    rs = self.zf.read(key)
-                    self[key] = rs
-                    return rs
-                except: pass
-            # Try to handle unix/windows path mismatch
-            # (Limited fallback)
-            return default
-
-        def items(self):
-            # For Strategy 3 (Global Search), this only iterates loaded items.
-            # Strategy 3 will fail for unloaded items. This is an acceptable trade-off for speed/memory.
-            return super().items()
+    # To support on-demand loading, we make a SmartDict.
+    # SmartZipDict is now defined globally to ensure picklability.
             
     # Use Smart Dict
     local_zip_map = SmartZipDict(zip_path, batch_files)
@@ -397,8 +403,9 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
              if fname not in local_zip_map:
                  # Attempt load one last time
                  local_zip_map.get(fname)
-                 
-             content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx)
+             
+             ctx = f"B{batch_idx}"
+             content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
              if content:
                  batch_htmls.append(content)
         except Exception as e:
@@ -509,6 +516,20 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 est_parts = (num_files + files_per_pdf - 1) // files_per_pdf
                 print(f"With --files-per-pdf {files_per_pdf}, this will generate approximately {est_parts} PDF parts.")
             
+            # Verify wkhtmltopdf
+            wkhtml_path = "wkhtmltopdf"
+            default_win_path = r'C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe'
+            if os.path.exists(default_win_path): wkhtml_path = default_win_path
+            
+            print(f"{'-'*40}")
+            print(f"Checking wkhtmltopdf: {wkhtml_path}")
+            try:
+                ver_out = subprocess.check_output([wkhtml_path, '--version'], stderr=subprocess.STDOUT, text=True)
+                print(f"  OK: {ver_out.strip()}")
+            except Exception as e:
+                print(f"  ERROR: Could not run wkhtmltopdf. Check installation. ({e})")
+            print(f"{'-'*40}")
+            
             return
 
         # --- Phase 1: Scanning/Reading ZIP ---
@@ -591,7 +612,8 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 # Map filename to original index
                 file_to_idx = {name: i for i, name in enumerate(all_files)}
                 
-                futures = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, css_lock, False, file_to_idx[f]): f for f in css_files}
+                # Pass "CSS" as context ID for pre-warm
+                futures = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, css_lock, False, file_to_idx[f], "CSS"): f for f in css_files}
                 
                 for future in as_completed(futures):
                     if stop_event.is_set(): break
@@ -660,6 +682,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                         future.result()
                     except Exception as e:
                         print(f"Pipeline job failed: {e}")
+                        traceback.print_exc()
             
             if not stop_event.is_set():
                 print("\nAll pipeline jobs completed successfully.")
