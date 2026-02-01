@@ -387,62 +387,75 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     # Use Smart Dict
     local_zip_map = SmartZipDict(zip_path, batch_files)
 
-    # 1. Indexing (Local to this batch)
-    if verbose or log_enabled:
-        print(f"  [Batch {batch_idx}/{total_batches}] Indexing {len(batch_files)} files...")
-
-    batch_htmls = []
-    local_css_cache = {} # Local empty cache
-
-    for i, fname in enumerate(batch_files):
-        # Stop event check is hard in process, skipping
-        current_global_idx = global_start_idx + i
-        # We catch exceptions here to prevent crash
-        try:
-             # Check if file exists in smart dict (might not if user provided bad list? No, came from namelist)
-             if fname not in local_zip_map:
-                 # Attempt load one last time
-                 local_zip_map.get(fname)
-             
-             ctx = f"B{batch_idx}"
-             content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
-             if content:
-                 batch_htmls.append(content)
-        except Exception as e:
-             if verbose: print(f"Error indexing {fname} in batch {batch_idx}: {e}")
-
-    if not batch_htmls:
-        print(f"  [Batch {batch_idx}] Warning: No valid content found.")
-        return
-
-    # 2. Combine
-    combined_html = "\n<div style='page-break-after: always;'></div>\n".join(batch_htmls)
+    # To avoid MemoryError, we STREAM content directly to wkhtmltopdf.
     
-    # FREE MEMORY: local_zip_map and batch_htmls are no longer needed
-    del local_zip_map
-    del batch_htmls
-    # Note: local_css_cache is small usually, but good practice
-    del local_css_cache
-    gc.collect()
-
-    # 3. Target Path
+    # 1. Target Path
     name_part, ext_part = os.path.splitext(output_basename)
     if not ext_part: ext_part = ".pdf"
-    
     filename = output_basename if total_batches == 1 else f"{name_part}_{batch_idx}{ext_part}"
     target_path = os.path.join(output_dir, filename)
     
-    # 4. Generate PDF
-    part_info = f"Part {batch_idx}/{total_batches}"
-    file_range_msg = f"Files ({len(batch_files)} files)"
+    # 2. Start wkhtmltopdf subprocess
+    cmd = [wkhtml_path, "--encoding", "utf-8", "--enable-local-file-access", "--disable-smart-shrinking", "--load-error-handling", "ignore", "--load-media-error-handling", "ignore"]
+    if not verbose and not log_enabled: cmd.append("--quiet")
+    cmd.extend(["-", target_path])
     
-    # run_wkhtmltopdf also checks stop_event (global). 
-    # In Process, stop_event is a copy of the state at fork (False).
-    # It won't update. So Ctrl+C might leave zombies. Valid limitation for now.
-    run_wkhtmltopdf(wkhtml_path, combined_html, target_path, verbose, part_info, file_range_msg, log_enabled)
+    if verbose: print(f"  [Batch {batch_idx}] Starting wkhtmltopdf stream...")
+    try:
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+    except Exception as e:
+        print(f"  [Batch {batch_idx}] Failed to start wkhtmltopdf: {e}")
+        return
+
+    # 3. Index and Stream
+    if verbose or log_enabled: print(f"  [Batch {batch_idx}/{total_batches}] Streaming {len(batch_files)} files...")
     
-    # FREE MEMORY: combined_html is huge string
-    del combined_html
+    local_css_cache = {} 
+    page_break = "\n<div style='page-break-after: always;'></div>\n"
+    count_written = 0
+    
+    try:
+        for i, fname in enumerate(batch_files):
+            try:
+                 if fname not in local_zip_map: local_zip_map.get(fname)
+                 ctx = f"B{batch_idx}"
+                 current_global_idx = global_start_idx + i
+                 content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
+                 
+                 if content:
+                     if count_written > 0: process.stdin.write(page_break)
+                     process.stdin.write(content)
+                     count_written += 1
+                 del content
+            except Exception as e:
+                 if verbose: print(f"Error indexing {fname} in batch {batch_idx}: {e}")
+        process.stdin.close()
+    except Exception as e:
+        print(f"  [Batch {batch_idx}] Error during streaming: {e}")
+        try: process.kill()
+        except: pass
+        return
+
+    # 4. Wait for finish
+    if verbose or log_enabled: print(f"  [Batch {batch_idx}] Waiting for PDF generation...")
+         
+    stdout, stderr = process.communicate()
+    
+    if process.returncode != 0:
+        print(f"  [Batch {batch_idx}] wkhtmltopdf failed (code {process.returncode})")
+        if verbose: print(stderr)
+    else:
+        if verbose: print(f"  [Batch {batch_idx}] Done.")
+    
+    if log_enabled and stderr:
+         for line in stderr.splitlines():
+             line = line.strip()
+             if not line: continue
+             if "Loading pages" in line or "Counting pages" in line or "Resolving links" in line:
+                 print(f"  [Job B{batch_idx}] {line}")
+
+    del local_zip_map
+    del local_css_cache
     gc.collect()
 
 
