@@ -229,7 +229,7 @@ def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", f
         print(f"Error during PDF generation for {part_info}: {e}")
         process.kill()
 
-def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False):
+def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False, file_index=-1):
     if stop_event.is_set(): return None, 0
     
     # Get thread name for logging
@@ -275,9 +275,84 @@ def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=Non
     if log_enabled:
          # Shorten thread name to just the number if possible "ThreadPoolExecutor-0_0" -> "0_0"
          short_t = t_name.replace("ThreadPoolExecutor-", "T")
-         print(f"  [Index][{short_t}] Processed: {file_name}")
+         idx_str = f"[#{file_index}]" if file_index >= 0 else ""
+         print(f"  [Index]{idx_str}[{short_t}] Processed: {file_name}")
 
     return content_result, file_size
+
+def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_map, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, css_cache, log_enabled, global_start_idx=0):
+    """
+    Worker function that handles the full lifecycle of a single PDF batch:
+    Indexing -> combining -> generating PDF.
+    Running this in a thread makes it an independent 'world' for that PDF.
+    """
+    if stop_event.is_set(): return
+    
+    # 1. Indexing (Local to this batch)
+    if verbose or log_enabled:
+        print(f"  [Batch {batch_idx}/{total_batches}] Indexing {len(batch_files)} files...")
+
+    batch_htmls = []
+    
+    # We index sequentially within this batch thread. 
+    # Since multiple batch threads run in parallel, we still achieve parallelism.
+    # Note: We pass None for css_lock because Phase 1.5 populated it.
+    for i, fname in enumerate(batch_files):
+        if stop_event.is_set(): return
+        current_global_idx = global_start_idx + i
+        content, _ = process_single_file(fname, zip_map, verbose, ignore_icons, css_cache, None, log_enabled, current_global_idx)
+        if content:
+            batch_htmls.append(content)
+
+    if not batch_htmls:
+        print(f"  [Batch {batch_idx}] Warning: No valid content found.")
+        return
+
+    # 2. Combine
+    combined_html = "\n<div style='page-break-after: always;'></div>\n".join(batch_htmls)
+
+    # 3. Target Path
+    name_part, ext_part = os.path.splitext(output_basename)
+    if not ext_part: ext_part = ".pdf"
+    
+    filename = output_basename if total_batches == 1 else f"{name_part}_{batch_idx}{ext_part}"
+    target_path = os.path.join(output_dir, filename)
+    
+    # 4. Generate PDF
+    # We construct a fake part_info for logging
+    part_info = f"Part {batch_idx}/{total_batches}"
+    file_range_msg = f"Files ({len(batch_files)} files)" # Simplified range msg
+
+    run_wkhtmltopdf(wkhtml_path, combined_html, target_path, verbose, part_info, file_range_msg, log_enabled)
+
+
+def load_zip_chunk(source, file_names):
+    """
+    Worker function to read a subset of files from a zip source.
+    source: can be a file path (str) or raw bytes (bytes)
+    file_names: list of specific files to read
+    """
+    if stop_event.is_set(): return {}
+    
+    chunk_map = {}
+    
+    # If source is bytes, wrap in BytesIO. If path, just use path.
+    # IMPORTANT: We create a NEW file-like object or handle for EVERY thread
+    # to ensure thread safety (avoiding shared cursor position).
+    if isinstance(source, bytes):
+        context = io.BytesIO(source)
+    else:
+        context = source # File path string
+
+    try:
+        with zipfile.ZipFile(context, 'r') as zf:
+            for name in file_names:
+                if stop_event.is_set(): break
+                chunk_map[name] = zf.read(name)
+    except Exception as e:
+        print(f"Error reading chunk: {e}")
+        
+    return chunk_map
 
 def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=None, info_mode=False, log_enabled=False):
     """
@@ -327,38 +402,157 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
         print(f"\n=== Phase 1: Reading ZIP File ({zip_path}) ===")
 
         # 1. Map all files in the ZIP for cross-referencing
+        # 1. Map all files in the ZIP for cross-referencing
         zip_map = {} # path -> binary data
         
+        # Pre-read source if memory mode
+        zip_source_data = None
         if memory_mode:
-            if verbose: print(f"  [MEMORY] Reading entire ZIP into memory...")
+            if verbose: print(f"  [MEMORY] Reading entire ZIP into memory buffer...")
             with open(zip_path, 'rb') as f:
-                zip_buffer = io.BytesIO(f.read())
-            zf_source = zip_buffer
+                zip_source_data = f.read() # Read as raw bytes
+            # We will pass raw bytes to workers
+            worker_source = zip_source_data
         else:
-            zf_source = zip_path
+            # We will pass file path to workers
+            worker_source = zip_path
 
-        with zipfile.ZipFile(zf_source, 'r') as zf:
+        # Get file list first (fast)
+        if verbose: print(f"  Scanning file list...")
+        all_names = []
+        # We need a temporary open just to get the namelist
+        temp_source = io.BytesIO(zip_source_data) if zip_source_data else zip_path
+        with zipfile.ZipFile(temp_source, 'r') as zf:
             for name in zf.namelist():
                 if not name.endswith('/'):
-                    zip_map[name] = zf.read(name)
+                    all_names.append(name)
+
+        num_files_total = len(all_names)
+        print(f"  found {num_files_total} files. Loading content with {jobs} threads...")
+
+        # Split into chunks for parallel loading
+        chunk_size = (num_files_total + jobs - 1) // jobs
+        chunks = [all_names[i:i + chunk_size] for i in range(0, num_files_total, chunk_size)]
+
+        # Run parallel loading
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            future_to_chunk = {executor.submit(load_zip_chunk, worker_source, chunk): chunk for chunk in chunks}
+            
+            for future in as_completed(future_to_chunk):
+                if stop_event.is_set(): break
+                try:
+                    partial_map = future.result()
+                    zip_map.update(partial_map)
+                except Exception as e:
+                    print(f"Error in zip loading worker: {e}")
+
+        if stop_event.is_set(): return
+
+        # Validate load
+        if len(zip_map) != num_files_total:
+             print(f"Warning: Loaded {len(zip_map)} files, expected {num_files_total}")
 
         all_files = sorted(zip_map.keys())
         num_all = len(all_files)
         
-        # --- Phase 2: Indexing ---
-        print(f"\n=== Phase 2: Indexing and Resolving Resources ===")
-        print(f"Found {num_all} files. Processing with {jobs} threads...")
-
+        # --- Phase 1.5: Pre-processing CSS ---
+        # To avoid repeated processing and locking during HTML phase, we process ALL CSS first.
+        css_files = [f for f in all_files if f.lower().endswith('.css')]
+        other_files = [f for f in all_files if not f.lower().endswith('.css')]
+        
         html_contents = [None] * num_all
         html_sizes = [0] * num_all
 
         # Prepare CSS cache
         css_cache = {}
         css_lock = threading.Lock()
+        
+        if css_files:
+            print(f"\n=== Phase 1.5: Pre-resolving {len(css_files)} CSS files ===")
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                # We don't need the results (html_contents) for CSS here, just side-effect of populating cache
+                # But we should store them if they are needed as "content" (though usually CSS is embed-only)
+                # Actually, zip2pdf includes CSS as separate pages if they are top-level files.
+                # So we must map them back to their original index in 'all_files' if we want to include them in output.
+                
+                # Map filename to original index
+                file_to_idx = {name: i for i, name in enumerate(all_files)}
+                
+                futures = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, css_lock, False, file_to_idx[f]): f for f in css_files}
+                
+                for future in as_completed(futures):
+                    if stop_event.is_set(): break
+                    fname = futures[future]
+                    try:
+                        content, size = future.result()
+                        # Store result because CSS files themselves might be part of the PDF output
+                        idx = file_to_idx[fname]
+                        html_contents[idx] = content
+                        html_sizes[idx] = size
+                    except Exception as e:
+                        print(f"Error pre-processing CSS {fname}: {e}")
 
+        # --- Phase 2: Indexing ---
+        print(f"\n=== Phase 2: Indexing and Resolving Resources ({len(other_files)} files) ===")
+        # We only process non-CSS files here (images, html, etc)
+        # Note: We technically re-process images if they are top-level files, 
+        # but images are leaf nodes so no recursion/cache needed.
+        
+        # Determine Execution Strategy
+        if files_per_pdf > 0:
+            # --- PIPELINE MODE ---
+            # We know exact batches upfront. We can run Index+Generate in parallel streams.
+            print(f"  [Mode] Independent Pipeline (files-per-pdf={files_per_pdf})")
+            
+            # Split other_files into batches
+            batches = [other_files[i:i + files_per_pdf] for i in range(0, len(other_files), files_per_pdf)]
+            total_batches = len(batches)
+            
+            print(f"  Created {total_batches} batch jobs.")
+            
+            # Find wkhtmltopdf path (needed for workers)
+            wkhtml_path = "wkhtmltopdf"
+            default_win_path = r'C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe'
+            if os.path.exists(default_win_path): wkhtml_path = default_win_path
+
+            actual_pdf_jobs = pdf_jobs if pdf_jobs and pdf_jobs > 0 else jobs
+            print(f"  Launching {actual_pdf_jobs} pipeline workers...")
+            
+            with ThreadPoolExecutor(max_workers=actual_pdf_jobs) as executor:
+                futures = []
+                for i, batch in enumerate(batches, 1):
+                    # Calculate start index for logging
+                    start_idx = (i - 1) * files_per_pdf
+                    futures.append(executor.submit(process_batch_pipeline, 
+                                                   batch, i, total_batches, 
+                                                   zip_map, output_dir, output_basename, 
+                                                   wkhtml_path, verbose, ignore_icons, 
+                                                   css_cache, log_enabled, start_idx))
+                
+                # Wait
+                for future in as_completed(futures):
+                    if stop_event.is_set(): break
+                    try: 
+                        future.result()
+                    except Exception as e:
+                        print(f"Pipeline job failed: {e}")
+            
+            if not stop_event.is_set():
+                print("\nAll pipeline jobs completed successfully.")
+            return
+            # --- END PIPELINE MODE ---
+
+        # --- STANDARD MODE (Index All -> Split by Size) ---
+        
         with ThreadPoolExecutor(max_workers=jobs) as executor:
-            future_to_idx = {executor.submit(process_single_file, all_files[i], zip_map, verbose, ignore_icons, css_cache, css_lock, log_enabled): i for i in range(num_all)}
+            # Only submit 'other_files'
+            file_to_idx = {name: i for i, name in enumerate(all_files)} # Re-use map
+            
+            # Pass None for css_lock to ensure Phase 2 never attempts to lock/write to cache
+            future_to_idx = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, None, log_enabled, file_to_idx[f]): file_to_idx[f] for f in other_files}
             indexed_count = 0
+            
+            num_others = len(other_files)
             for future in as_completed(future_to_idx):
                 if stop_event.is_set(): break
                 idx = future_to_idx[future]
@@ -373,8 +567,8 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 # Logging moved inside process_single_file to capture thread ID correctly
                 
                 indexed_count += 1
-                if not verbose and not log_enabled and (indexed_count % 10 == 0 or indexed_count == num_all):
-                    print(f"\r  > Indexing files... [{indexed_count}/{num_all}]", end="", flush=True)
+                if not verbose and not log_enabled and (indexed_count % 10 == 0 or indexed_count == num_others):
+                    print(f"\r  > Indexing files... [{indexed_count}/{num_others}]", end="", flush=True)
         
         if stop_event.is_set():
             print("\nOperation cancelled.")
