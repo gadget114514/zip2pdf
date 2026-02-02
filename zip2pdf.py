@@ -15,6 +15,19 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import time
 import gc
 import traceback
+import tempfile
+
+sys.setrecursionlimit(5000)
+
+try:
+    from xhtml2pdf import pisa
+except ImportError:
+    pisa = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 # Global control for interruptions
 stop_event = threading.Event()
@@ -124,6 +137,7 @@ def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=
         return text
 
     # For HTML files, separate head and body to apply specific rules
+    
     if current_file.lower().endswith(('.html', '.htm')):
         parts = re.split(r'(</head>)', content, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) == 3:
@@ -131,6 +145,24 @@ def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=
             return apply_resolution(parts[0], is_head=True) + parts[1] + apply_resolution(parts[2], is_head=False)
     
     return apply_resolution(content)
+
+def run_native_pdf(html_str, target, verbose_mode, part_info=""):
+    if not pisa:
+        print(f"  [Error] xhtml2pdf is not installed. Skipping {target}.")
+        return
+
+    if verbose_mode: print(f"  [{part_info}] Converting using xhtml2pdf...")
+    
+    try:
+        with open(target, "wb") as pdf_file:
+            pisa_status = pisa.CreatePDF(html_str, dest=pdf_file)
+            
+        if pisa_status.err:
+             print(f"  [Error] Failed to convert {part_info} (xhtml2pdf error)")
+        elif verbose_mode:
+             print(f"  [{part_info}] Done.")
+    except Exception as e:
+        print(f"  [Error] Native conversion exception for {part_info}: {e}")
 
 def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", file_range_info="", log_enabled=False):
     if stop_event.is_set():
@@ -318,7 +350,7 @@ class SmartZipDict(dict):
         # Strategy 3 will fail for unloaded items. This is an acceptable trade-off for speed/memory.
         return super().items()
 
-def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0):
+def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0, native_mode=False):
     """
     Worker function that handles the full lifecycle of a single PDF batch.
     Run as a PROCESS. No global shared memory.
@@ -395,6 +427,90 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     filename = output_basename if total_batches == 1 else f"{name_part}_{batch_idx}{ext_part}"
     target_path = os.path.join(output_dir, filename)
     
+    if native_mode:
+        # --- NATIVE MODE ---
+        if verbose: print(f"  [Batch {batch_idx}] Indexing (Native Mode)...")
+        local_css_cache = {}
+        accumulated_html = []
+        page_break = "\n<pdf:nextpage />\n" # xhtml2pdf specific page break
+        
+        # Default CSS to ensure images and tables are preserved and readable for NotebookLM
+        native_css = """
+        <style>
+            @page { margin: 2cm; }
+            body { font-family: sans-serif; }
+            img { max-width: 100%; height: auto; } /* Ensure images don't overflow */
+            table { width: 100%; border-collapse: collapse; margin-bottom: 1em; }
+            th, td { border: 1px solid #999; padding: 5px; vertical-align: top; }
+            pre { white-space: pre-wrap; background: #f4f4f4; padding: 10px; }
+        </style>
+        """
+        
+        # 1. Gather HTML with per-file recovery
+        # Use a temporary file to store the aggregated HTML to avoid MemoryError
+        with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as tmp_html:
+            tmp_html.write(f"<html><head>{native_css}</head><body>")
+            
+            has_content = False
+            for i, fname in enumerate(batch_files):
+                try:
+                     if fname not in local_zip_map: local_zip_map.get(fname)
+                     ctx = f"B{batch_idx}"
+                     current_global_idx = global_start_idx + i
+                     content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
+                     
+                     if content:
+                         if has_content: tmp_html.write(page_break)
+                         tmp_html.write(content)
+                         has_content = True
+                         
+                except Exception as e:
+                    print(f"  [Batch {batch_idx}] Error processing file {fname}: {e}")
+                    # Continue to next file
+            
+            tmp_html.write("</body></html>")
+            tmp_html.flush()
+            tmp_html.seek(0)
+            
+            # 2. Convert to PDF with fallback
+            try:
+                 if verbose: print(f"  [Batch {batch_idx}] Sending HTML stream to xhtml2pdf...")
+                 
+                 # Attempt 1: Direct conversion
+                 try:
+                     run_native_pdf(tmp_html, target_path, verbose, f"Batch {batch_idx}")
+                 except Exception as pdf_err:
+                     print(f"  [Batch {batch_idx}] PDF Generation failed ({pdf_err}). Attempting to sanitize HTML...")
+                     
+                     # Attempt 2: Loose Parsing with BeautifulSoup
+                     if BeautifulSoup:
+                         try:
+                             tmp_html.seek(0)
+                             # Note: BeautifulSoup might consume memory, but it's a fallback.
+                             soup = BeautifulSoup(tmp_html, "html.parser")
+                             # Strip Scripts
+                             for script in soup(["script", "style", "iframe", "object"]):
+                                 script.decompose()
+                             sanitized_html = str(soup)
+                             # Add back our CSS
+                             sanitized_html = f"<html><head>{native_css}</head><body>{sanitized_html}</body></html>"
+                             
+                             print(f"  [Batch {batch_idx}] Retrying with sanitized HTML...")
+                             run_native_pdf(sanitized_html, target_path, verbose, f"Batch {batch_idx} (Sanitized)")
+                         except Exception as bs_err:
+                             print(f"  [Batch {batch_idx}] Sanitization failed: {bs_err}")
+                             raise pdf_err # Re-raise original
+                     else:
+                         raise pdf_err
+
+            except Exception as e:
+                 print(f"  [Batch {batch_idx}] Critical Native Mode Failure: {repr(e)}")
+                 traceback.print_exc()
+        
+        return
+
+        # --- END NATIVE MODE ---
+
     # 2. Start wkhtmltopdf subprocess
     cmd = [wkhtml_path, "--encoding", "utf-8", "--enable-local-file-access", "--disable-smart-shrinking", "--load-error-handling", "ignore", "--load-media-error-handling", "ignore"]
     if not verbose and not log_enabled: cmd.append("--quiet")
@@ -402,7 +518,8 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     
     if verbose: print(f"  [Batch {batch_idx}] Starting wkhtmltopdf stream...")
     try:
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+        # Redirect stdout to DEVNULL as we don't use it and don't want it to fill buffer
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
     except Exception as e:
         print(f"  [Batch {batch_idx}] Failed to start wkhtmltopdf: {e}")
         return
@@ -414,7 +531,35 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     page_break = "\n<div style='page-break-after: always;'></div>\n"
     count_written = 0
     
+    # Start stderr reader thread to prevent deadlock
+    stderr_lines = []
+    def stderr_reader():
+        try:
+            for line in process.stderr:
+                line = line.strip()
+                if line:
+                    if verbose: 
+                        print(f"    [wkhtml-{batch_idx}] {line}")
+                    elif log_enabled and ("Error" in line or "Warning" in line or "Processing" in line):
+                         # Capture some logs for debug if needed
+                        stderr_lines.append(line)
+        except: pass
+
+    t_err = threading.Thread(target=stderr_reader)
+    t_err.daemon = True
+    t_err.start()
+
     try:
+        def write_chunked(text):
+            chunk_size = 64 * 1024 # 64KB chunks
+            text_len = len(text)
+            for i in range(0, text_len, chunk_size):
+                if stop_event.is_set(): raise KeyboardInterrupt
+                if process.poll() is not None:
+                    raise BrokenPipeError(f"wkhtmltopdf exited unexpectedly with code {process.returncode}")
+                process.stdin.write(text[i : i + chunk_size])
+                process.stdin.flush() # Ensure it goes out
+                
         for i, fname in enumerate(batch_files):
             try:
                  if fname not in local_zip_map: local_zip_map.get(fname)
@@ -423,15 +568,30 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
                  content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
                  
                  if content:
-                     if count_written > 0: process.stdin.write(page_break)
-                     process.stdin.write(content)
+                     if count_written > 0: 
+                         write_chunked(page_break)
+                     
+                     if verbose: print(f"    [Batch {batch_idx}] Writing {len(content)} chars for {fname}...")
+                     write_chunked(content)
                      count_written += 1
                  del content
+            except BrokenPipeError as bpe:
+                print(f"  [Batch {batch_idx}] Pipe Broken during {fname}: {bpe}")
+                break
             except Exception as e:
                  if verbose: print(f"Error indexing {fname} in batch {batch_idx}: {e}")
-        process.stdin.close()
+                 if process.poll() is not None:
+                     print(f"  [Batch {batch_idx}] Process died while processing {fname}. Exit code: {process.returncode}")
+                     break
+                 if "[Errno 22]" in str(e):
+                     print(f"  [Batch {batch_idx}] Invalid Argument Error on {fname}. Size: {len(content) if 'content' in locals() and content else 'N/A'}")
+                     break
+
+        if process.poll() is None:
+            process.stdin.close()
+            
     except Exception as e:
-        print(f"  [Batch {batch_idx}] Error during streaming: {e}")
+        print(f"  [Batch {batch_idx}] Error during streaming loop: {e}")
         try: process.kill()
         except: pass
         return
@@ -439,20 +599,16 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     # 4. Wait for finish
     if verbose or log_enabled: print(f"  [Batch {batch_idx}] Waiting for PDF generation...")
          
-    stdout, stderr = process.communicate()
+    process.wait()
+    t_err.join(timeout=30)
     
     if process.returncode != 0:
         print(f"  [Batch {batch_idx}] wkhtmltopdf failed (code {process.returncode})")
-        if verbose: print(stderr)
+        # Print captured stderr lines if failed
+        for l in stderr_lines:
+            print(f"    [Log] {l}")
     else:
         if verbose: print(f"  [Batch {batch_idx}] Done.")
-    
-    if log_enabled and stderr:
-         for line in stderr.splitlines():
-             line = line.strip()
-             if not line: continue
-             if "Loading pages" in line or "Counting pages" in line or "Resolving links" in line:
-                 print(f"  [Job B{batch_idx}] {line}")
 
     del local_zip_map
     del local_css_cache
@@ -487,13 +643,21 @@ def load_zip_chunk(source, file_names):
         
     return chunk_map
 
-def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=None, info_mode=False, log_enabled=False):
+def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=None, info_mode=False, log_enabled=False, native_mode=False):
     """
     Reads files from a ZIP and converts them into one or more PDF files in output_dir.
     """
     if not os.path.exists(zip_path):
         print(f"Error: ZIP file '{zip_path}' not found.")
         return
+
+    if native_mode:
+        if not pisa:
+             print("Error: -z (native mode) was requested but xhtml2pdf is not installed.")
+             print("Please install it via: pip install xhtml2pdf")
+             return
+        print("[Mode] Using Native Python PDF Engine (xhtml2pdf). wkhtmltopdf will be skipped.")
+        print("       Optimizing for text content (NotebookLM compatible).")
 
     # Ensure output directory exists
     if not os.path.exists(output_dir):
@@ -684,7 +848,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                                                    batch, i, total_batches, 
                                                    zip_path, output_dir, output_basename, 
                                                    wkhtml_path, verbose, ignore_icons, 
-                                                   log_enabled, start_idx))
+                                                   log_enabled, start_idx, native_mode))
                 
                 # Wait
                 for future in as_completed(futures):
@@ -813,9 +977,13 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 current_file_idx = end_idx
                 
                 # Add page break between documents in a batch
-                combined_html = "\n<div style='page-break-after: always;'></div>\n".join(batch)
+                page_break_str = "\n<pdf:nextpage />\n" if native_mode else "\n<div style='page-break-after: always;'></div>\n"
+                combined_html = page_break_str.join(batch)
                 
-                futures.append(executor.submit(run_wkhtmltopdf, wkhtml_path, combined_html, target_path, verbose, f"Part {i}/{len(batches)}", file_range_msg, log_enabled))
+                if native_mode:
+                    futures.append(executor.submit(run_native_pdf, combined_html, target_path, verbose, f"Part {i}/{len(batches)}"))
+                else:
+                    futures.append(executor.submit(run_wkhtmltopdf, wkhtml_path, combined_html, target_path, verbose, f"Part {i}/{len(batches)}", file_range_msg, log_enabled))
             
             for future in as_completed(futures):
                 if stop_event.is_set(): break
@@ -864,13 +1032,14 @@ def main():
     parser.add_argument("-c", "--memory-mode", action="store_true", help="Read entire ZIP file into memory before processing")
     parser.add_argument("-x", "--ignore-icons", action="store_true", help="Ignore favicon and header section icons")
     parser.add_argument("-j", "--jobs", type=int, default=4, help="Number of parallel jobs (default: 4)")
+    parser.add_argument("-z", "--native", action="store_true", help="Use native Python PDF engine (xhtml2pdf) instead of wkhtmltopdf. Optimized for text/data extraction (e.g. NotebookLM).")
     parser.add_argument("--files-per-pdf", type=int, default=0, help="Enforce specific number of files per PDF (overrides auto-splitting)")
     parser.add_argument("--pdf-jobs", type=int, default=0, help="Number of parallel wkhtmltopdf instances (default: same as --jobs)")
     parser.add_argument("--info", action="store_true", help="Display file count and details without converting")
     parser.add_argument("--log", action="store_true", help="Show processing log messages (filenames and wkhtmltopdf output)")
 
     args = parser.parse_args()
-    convert_zip_to_pdf(args.input_zip, args.output_dir, args.output_basename, args.max_size, args.max_files, args.verbose, args.memory_mode, args.ignore_icons, args.jobs, args.files_per_pdf, args.pdf_jobs, args.info, args.log)
+    convert_zip_to_pdf(args.input_zip, args.output_dir, args.output_basename, args.max_size, args.max_files, args.verbose, args.memory_mode, args.ignore_icons, args.jobs, args.files_per_pdf, args.pdf_jobs, args.info, args.log, args.native)
 
 if __name__ == "__main__":
     main()

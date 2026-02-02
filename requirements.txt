@@ -1,1 +1,3 @@
 pdfkit
+xhtml2pdf
+beautifulsoup4
