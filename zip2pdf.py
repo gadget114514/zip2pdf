@@ -34,7 +34,7 @@ stop_event = threading.Event()
 active_procs = []
 procs_lock = threading.Lock()
 
-def get_b64_src(zip_map, current_html_path, linked_path, depth, verbose, css_cache=None, css_lock=None):
+def get_b64_src(zip_map, current_html_path, linked_path, depth, verbose, css_cache=None, css_lock=None, ignore_images=False):
     if stop_event.is_set(): return None
     if depth > 5:
         if verbose: print(f"    [SKIP] Depth limit reached for {linked_path}")
@@ -73,6 +73,12 @@ def get_b64_src(zip_map, current_html_path, linked_path, depth, verbose, css_cac
     if data:
         if verbose: print(f"    [RESOLVED] {linked_path}")
         ext = os.path.splitext(found_path.lower())[1]
+        
+        # Check if we should ignore images
+        if ignore_images and ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}:
+            if verbose: print(f"    [SKIP] Ignoring image: {linked_path}")
+            return None
+
         mime = mimetypes.guess_type(found_path)[0] or 'application/octet-stream'
         
         # If it's a CSS file, we should recursively resolve its imports (depth + 1)
@@ -102,7 +108,7 @@ def get_b64_src(zip_map, current_html_path, linked_path, depth, verbose, css_cac
         print(f"    [MISSING]  {linked_path}")
     return None
 
-def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=None, css_lock=None, ignore_icons=False):
+def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=None, css_lock=None, ignore_icons=False, ignore_images=False):
     if depth > 5: return content
     
     if verbose: print(f"  > [{depth}] Resolving resources for {current_file}...")
@@ -114,23 +120,41 @@ def resolve_resources(zip_map, current_file, content, depth, verbose, css_cache=
             if path.lower().startswith(('http://', 'https://', 'data:')):
                 return match.group(0)
             
+            ext = os.path.splitext(path.lower())[1]
+            is_image = ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
+
+            if ignore_images and is_image:
+                if verbose: print(f"    [SKIP] Ignoring image: {path}")
+                return '' # Or something else? Strip the whole tag eventually
+
             if ignore_icons:
-                ext = os.path.splitext(path.lower())[1]
                 is_favicon = "favicon" in path.lower() or ext == ".ico"
                 
-                if is_favicon or (is_head and ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}):
+                if is_favicon or (is_head and is_image):
                     if verbose and is_favicon: print(f"    [SKIP] Ignoring icon/favicon: {path}")
                     return match.group(0)
             
-            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock)
+            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock, ignore_images)
             return f'{attr}="{b64}"' if b64 else match.group(0)
         
         text = re.sub(r'(src|href)=["\'](.*?)["\']', replacer, text)
         
+        if ignore_images:
+            # Strip <img> tags entirely
+            text = re.sub(r'<img\s+[^>]*src=["\'](.*?)["\'][^>]*>', '', text, flags=re.IGNORECASE)
+            # Also catch <img> tags with src as anything else
+            text = re.sub(r'<img\s+[^>]*>', '', text, flags=re.IGNORECASE)
+
         def css_url_repl(match):
             path = match.group(1).strip('"\'')
             if path.lower().startswith(('http', 'data')): return match.group(0)
-            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock)
+            
+            if ignore_images:
+                ext = os.path.splitext(path.lower())[1]
+                if ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}:
+                    return 'url("")'
+
+            b64 = get_b64_src(zip_map, current_file, path, depth, verbose, css_cache, css_lock, ignore_images)
             return f'url("{b64}")' if b64 else match.group(0)
         
         text = re.sub(r'url\((.*?)\)', css_url_repl, text)
@@ -266,7 +290,7 @@ def run_wkhtmltopdf(wkhtml_path, html_str, target, verbose_mode, part_info="", f
         print(f"Error during PDF generation for {part_info}: {e}")
         process.kill()
 
-def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False, file_index=-1, context_id=None):
+def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=None, css_lock=None, log_enabled=False, file_index=-1, context_id=None, ignore_images=False):
     if stop_event.is_set(): return None, 0
     
     # Get identifier for logging (Thread Name or Explicit Batch ID)
@@ -288,10 +312,12 @@ def process_single_file(file_name, zip_map, verbose, ignore_icons, css_cache=Non
             text = raw_data.decode('utf-8')
         except UnicodeDecodeError:
             text = raw_data.decode('latin-1')
-        content_result = resolve_resources(zip_map, file_name, text, 0, verbose, css_cache, css_lock, ignore_icons)
+        content_result = resolve_resources(zip_map, file_name, text, 0, verbose, css_cache, css_lock, ignore_icons, ignore_images)
     
     # Image: Wrap in HTML
     elif ext in {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}:
+        if ignore_images:
+            return None, 0
         mime_type = mimetypes.guess_type(file_name)[0] or 'image/png'
         b64 = base64.b64encode(raw_data).decode('utf-8')
         content_result = f'<div style="text-align:center; page-break-inside: avoid;"><img src="data:{mime_type};base64,{b64}" style="max-width:100%; height:auto;"></div>'
@@ -350,7 +376,7 @@ class SmartZipDict(dict):
         # Strategy 3 will fail for unloaded items. This is an acceptable trade-off for speed/memory.
         return super().items()
 
-def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0, native_mode=False):
+def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, output_dir, output_basename, wkhtml_path, verbose, ignore_icons, log_enabled, global_start_idx=0, native_mode=False, save_temp=False, html_only=False, ignore_images=False):
     """
     Worker function that handles the full lifecycle of a single PDF batch.
     Run as a PROCESS. No global shared memory.
@@ -457,7 +483,7 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
                      if fname not in local_zip_map: local_zip_map.get(fname)
                      ctx = f"B{batch_idx}"
                      current_global_idx = global_start_idx + i
-                     content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
+                     content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx, ignore_images)
                      
                      if content:
                          if has_content: tmp_html.write(page_break)
@@ -471,8 +497,24 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
             tmp_html.write("</body></html>")
             tmp_html.flush()
             tmp_html.seek(0)
+
+            # 2. Save Intermediate HTML if requested
+            if save_temp:
+                try:
+                    # In Native Mode, we have the full HTML in tmp_html
+                    with open(target_path.replace('.pdf', '.html'), 'w', encoding='utf-8') as f_out:
+                         tmp_html.seek(0)
+                         f_out.write(tmp_html.read())
+                    if verbose: print(f"  [Batch {batch_idx}] Saved intermediate HTML to {target_path.replace('.pdf', '.html')}")
+                except Exception as e:
+                    print(f"  [Batch {batch_idx}] Warning: Failed to save intermediate HTML: {e}")
             
-            # 2. Convert to PDF with fallback
+            # 3. Skip PDF if html_only
+            if 'html_only' in locals() and locals().get('html_only'):
+                if verbose: print(f"  [Batch {batch_idx}] Skipping PDF generation (--html-only)")
+                return
+
+            # 4. Convert to PDF with fallback
             try:
                  if verbose: print(f"  [Batch {batch_idx}] Sending HTML stream to xhtml2pdf...")
                  
@@ -516,13 +558,16 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     if not verbose and not log_enabled: cmd.append("--quiet")
     cmd.extend(["-", target_path])
     
-    if verbose: print(f"  [Batch {batch_idx}] Starting wkhtmltopdf stream...")
-    try:
-        # Redirect stdout to DEVNULL as we don't use it and don't want it to fill buffer
-        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
-    except Exception as e:
-        print(f"  [Batch {batch_idx}] Failed to start wkhtmltopdf: {e}")
-        return
+    if html_only:
+        if verbose: print(f"  [Batch {batch_idx}] Skipping PDF generation (--html-only)")
+    else:
+        if verbose: print(f"  [Batch {batch_idx}] Starting wkhtmltopdf stream...")
+        try:
+            # Redirect stdout to DEVNULL as we don't use it and don't want it to fill buffer
+            process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+        except Exception as e:
+            print(f"  [Batch {batch_idx}] Failed to start wkhtmltopdf: {e}")
+            return
 
     # 3. Index and Stream
     if verbose or log_enabled: print(f"  [Batch {batch_idx}/{total_batches}] Streaming {len(batch_files)} files...")
@@ -530,6 +575,19 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     local_css_cache = {} 
     page_break = "\n<div style='page-break-after: always;'></div>\n"
     count_written = 0
+    
+    html_save_file = None
+    if save_temp:
+        name_part, ext_part = os.path.splitext(output_basename)
+        filename = output_basename if total_batches == 1 else f"{name_part}_{batch_idx}{ext_part}"
+        base_name_only = os.path.splitext(filename)[0]
+        html_filename = base_name_only + ".html"
+        html_path = os.path.join(output_dir, html_filename)
+        try:
+            html_save_file = open(html_path, 'w', encoding='utf-8')
+            if verbose: print(f"  [Batch {batch_idx}] Saving HTML dump to {html_path}...")
+        except Exception as e:
+             print(f"  [Batch {batch_idx}] Warning: Could not open HTML save file: {e}")
     
     # Start stderr reader thread to prevent deadlock
     stderr_lines = []
@@ -555,17 +613,20 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
             text_len = len(text)
             for i in range(0, text_len, chunk_size):
                 if stop_event.is_set(): raise KeyboardInterrupt
-                if process.poll() is not None:
-                    raise BrokenPipeError(f"wkhtmltopdf exited unexpectedly with code {process.returncode}")
-                process.stdin.write(text[i : i + chunk_size])
-                process.stdin.flush() # Ensure it goes out
+                if not html_only:
+                    if process.poll() is not None:
+                        raise BrokenPipeError(f"wkhtmltopdf exited unexpectedly with code {process.returncode}")
+                    process.stdin.write(text[i : i + chunk_size])
+                    process.stdin.flush() # Ensure it goes out
+                if html_save_file:
+                    html_save_file.write(text[i : i + chunk_size])
                 
         for i, fname in enumerate(batch_files):
             try:
                  if fname not in local_zip_map: local_zip_map.get(fname)
                  ctx = f"B{batch_idx}"
                  current_global_idx = global_start_idx + i
-                 content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx)
+                 content, _ = process_single_file(fname, local_zip_map, verbose, ignore_icons, local_css_cache, None, log_enabled, current_global_idx, ctx, ignore_images)
                  
                  if content:
                      if count_written > 0: 
@@ -587,7 +648,7 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
                      print(f"  [Batch {batch_idx}] Invalid Argument Error on {fname}. Size: {len(content) if 'content' in locals() and content else 'N/A'}")
                      break
 
-        if process.poll() is None:
+        if not html_only and process.poll() is None:
             process.stdin.close()
             
     except Exception as e:
@@ -599,17 +660,23 @@ def process_batch_pipeline(batch_files, batch_idx, total_batches, zip_path, outp
     # 4. Wait for finish
     if verbose or log_enabled: print(f"  [Batch {batch_idx}] Waiting for PDF generation...")
          
-    process.wait()
-    t_err.join(timeout=30)
-    
-    if process.returncode != 0:
-        print(f"  [Batch {batch_idx}] wkhtmltopdf failed (code {process.returncode})")
-        # Print captured stderr lines if failed
-        for l in stderr_lines:
-            print(f"    [Log] {l}")
+    if not html_only:
+        process.wait()
+        t_err.join(timeout=30)
+        
+        if process.returncode != 0:
+            print(f"  [Batch {batch_idx}] wkhtmltopdf failed (code {process.returncode})")
+            # Print captured stderr lines if failed
+            for l in stderr_lines:
+                print(f"    [Log] {l}")
+        else:
+            if verbose: print(f"  [Batch {batch_idx}] Done.")
     else:
-        if verbose: print(f"  [Batch {batch_idx}] Done.")
+        if verbose: print(f"  [Batch {batch_idx}] HTML generation done.")
 
+    if html_save_file:
+        html_save_file.close()
+    
     del local_zip_map
     del local_css_cache
     gc.collect()
@@ -643,7 +710,7 @@ def load_zip_chunk(source, file_names):
         
     return chunk_map
 
-def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=None, info_mode=False, log_enabled=False, native_mode=False):
+def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, max_files=20, verbose=False, memory_mode=False, ignore_icons=False, jobs=4, files_per_pdf=0, pdf_jobs=4, info_mode=False, log_enabled=False, native_mode=False, save_temp=False, html_only=False, ignore_images=False):
     """
     Reads files from a ZIP and converts them into one or more PDF files in output_dir.
     """
@@ -790,7 +857,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 file_to_idx = {name: i for i, name in enumerate(all_files)}
                 
                 # Pass "CSS" as context ID for pre-warm
-                futures = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, css_lock, False, file_to_idx[f], "CSS"): f for f in css_files}
+                futures = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, css_lock, False, file_to_idx[f], "CSS", ignore_images): f for f in css_files}
                 
                 for future in as_completed(futures):
                     if stop_event.is_set(): break
@@ -848,7 +915,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                                                    batch, i, total_batches, 
                                                    zip_path, output_dir, output_basename, 
                                                    wkhtml_path, verbose, ignore_icons, 
-                                                   log_enabled, start_idx, native_mode))
+                                                    log_enabled, start_idx, native_mode, save_temp, html_only, ignore_images))
                 
                 # Wait
                 for future in as_completed(futures):
@@ -873,7 +940,7 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
             file_to_idx = {name: i for i, name in enumerate(all_files)} # Re-use map
             
             # Pass None for css_lock to ensure Phase 2 never attempts to lock/write to cache
-            future_to_idx = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, None, log_enabled, file_to_idx[f]): file_to_idx[f] for f in other_files}
+            future_to_idx = {executor.submit(process_single_file, f, zip_map, verbose, ignore_icons, css_cache, None, log_enabled, file_to_idx[f], None, ignore_images): file_to_idx[f] for f in other_files}
             indexed_count = 0
             
             num_others = len(other_files)
@@ -980,6 +1047,32 @@ def convert_zip_to_pdf(zip_path, output_dir, output_basename, max_size_mb=150, m
                 page_break_str = "\n<pdf:nextpage />\n" if native_mode else "\n<div style='page-break-after: always;'></div>\n"
                 combined_html = page_break_str.join(batch)
                 
+                if save_temp:
+                    html_filename = output_basename if len(batches) == 1 else f"{name_part}_{i}{ext_part}"
+                    # replace extension with .html
+                    base_name_only = os.path.splitext(html_filename)[0]
+                    html_filename = base_name_only + ".html"
+                    html_path = os.path.join(output_dir, html_filename)
+                    try:
+                        with open(html_path, 'w', encoding='utf-8') as f:
+                            # Write in chunks to handle large files and disk space gracefully
+                            chunk_size = 1024 * 1024 # 1MB chunks
+                            for start in range(0, len(combined_html), chunk_size):
+                                f.write(combined_html[start : start + chunk_size])
+                        if verbose: print(f"    [Batch {i}] Saved HTML to {html_filename}")
+                    except IOError as e:
+                        if "No space left on device" in str(e) or e.errno == 28:
+                            print(f"    [Batch {i}] ERROR: No space left on device while saving {html_filename}")
+                        else:
+                            print(f"    [Batch {i}] Warning: Failed to save HTML: {e}")
+                    except Exception as e:
+                        print(f"    [Batch {i}] Warning: Failed to save HTML: {e}")
+
+                
+                if html_only:
+                    if verbose: print(f"    [Batch {i}] Skipping PDF Part {i} (--html-only)")
+                    continue
+
                 if native_mode:
                     futures.append(executor.submit(run_native_pdf, combined_html, target_path, verbose, f"Part {i}/{len(batches)}"))
                 else:
@@ -1038,8 +1131,15 @@ def main():
     parser.add_argument("--info", action="store_true", help="Display file count and details without converting")
     parser.add_argument("--log", action="store_true", help="Show processing log messages (filenames and wkhtmltopdf output)")
 
+    parser.add_argument("-t", "--save-temp", action="store_true", help="Save intermediate HTML files to output directory before converting.")
+
+    parser.add_argument("--html-only", action="store_true", help="Only save intermediate HTML files and skip PDF conversion.")
+    parser.add_argument("--ignore-image", "--ignore-images", action="store_true", help="Remove all <img> tags and skip inlining image data.")
     args = parser.parse_args()
-    convert_zip_to_pdf(args.input_zip, args.output_dir, args.output_basename, args.max_size, args.max_files, args.verbose, args.memory_mode, args.ignore_icons, args.jobs, args.files_per_pdf, args.pdf_jobs, args.info, args.log, args.native)
+    # Explicitly map --html-only to save_temp if it's set
+    if args.html_only:
+        args.save_temp = True
+    convert_zip_to_pdf(args.input_zip, args.output_dir, args.output_basename, args.max_size, args.max_files, args.verbose, args.memory_mode, args.ignore_icons, args.jobs, args.files_per_pdf, args.pdf_jobs, args.info, args.log, args.native, args.save_temp, args.html_only, args.ignore_image)
 
 if __name__ == "__main__":
     main()

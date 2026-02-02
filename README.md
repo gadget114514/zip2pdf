@@ -92,6 +92,8 @@ options:
   --files-per-pdf N     Enforce specific files per PDF (overrides size auto-split)
   --info                Display summary stats without converting
   --log                 Show active process filenames and wkhtmltopdf output
+  -t, --save-temp       Save intermediate HTML files to output directory
+  --html-only           Only save intermediate HTML files and skip PDF conversion
 ```
 
 ## How It Works

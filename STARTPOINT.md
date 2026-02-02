@@ -19,6 +19,8 @@ A Windows console application to convert HTML files inside a ZIP archive into a 
 - `-v`: Verbose mode (show detailed indexing and resolution logs)
 - `-c`: Memory mode (read entire ZIP into RAM first)
 - `-x`: Ignore icons (skips favicons and known icon files)
+- `-t`, `--save-temp`: Save intermediate HTML files to output directory
+- `--html-only`: Only save intermediate HTML files and skip PDF conversion
 
 ## Usage
 
